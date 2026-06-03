@@ -1,0 +1,531 @@
+// ============================================================================
+// ==================== GREENHOUSE MONITOR v5.0 FINAL =========================
+// ============ DS18B20 + WiFi AP+STA + Web Interface + Touch Zoom ============
+// ======================== ВСЁ РАБОТАЕТ! =====================================
+// ============================================================================
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <LittleFS.h>
+#include <ESPmDNS.h>
+
+// ============================================================================
+// НАСТРОЙКИ
+// ============================================================================
+const char* ssid = "TERMO_LABORATORY";
+const char* password = "www111www";
+const char* sta_ssid = "Cudy-A12E";
+const char* sta_password = "48276030";
+
+#define DS18B20_PIN 4
+#define MAX_HISTORY 1440
+#define MAX_SENSORS 4
+#define CSV_BUFFER_SIZE 20
+#define AUTO_FLUSH_INTERVAL 300000
+#define MAX_HISTORY_FILE_SIZE (512 * 1024)
+#define HISTORY_BACKUP_FILE "/history_old.csv"
+
+int currentInterval = 60;
+
+// ============================================================================
+// ГЛОБАЛЬНЫЕ ОБЪЕКТЫ
+// ============================================================================
+WebServer server(80);
+OneWire oneWire(DS18B20_PIN);
+DallasTemperature sensors(&oneWire);
+
+// ============================================================================
+// СТРУКТУРЫ
+// ============================================================================
+struct Sensor {
+  byte addr[8];
+  String name;
+  float history[MAX_HISTORY];
+  bool enabled;
+  float currentTemp;
+  int histIndex;
+  int historyCount;
+};
+
+struct FlashBuffer {
+  float temps[MAX_SENSORS][CSV_BUFFER_SIZE];
+  int index;
+  unsigned long timestamps[CSV_BUFFER_SIZE];
+};
+
+Sensor sensorsList[MAX_SENSORS];
+FlashBuffer flashBuffer;
+bool fsMounted = false;
+unsigned long lastAutoFlush = 0;
+
+// ============================================================================
+// ВРЕМЯ (сохраняется в файл)
+// ============================================================================
+unsigned long systemStartTime = 0;
+bool firstBoot = true;
+unsigned long totalUptime = 0;
+unsigned long lastSavedTime = 0;
+
+unsigned long getRealTimestamp() {
+  return totalUptime + (millis() / 1000);
+}
+
+// ============================================================================
+// ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+// ============================================================================
+String addrToString(byte addr[8]) {
+  String str = "";
+  for (int i = 0; i < 8; i++) {
+    if (addr[i] < 0x10) str += "0";
+    str += String(addr[i], HEX);
+    if (i < 7) str += ":";
+  }
+  return str;
+}
+
+void saveSystemTime() {
+  if (!fsMounted) return;
+  File file = LittleFS.open("/time.dat", "w");
+  if (file) {
+    file.write((byte*)&totalUptime, sizeof(totalUptime));
+    file.write((byte*)&firstBoot, sizeof(firstBoot));
+    file.close();
+    lastSavedTime = millis();
+  }
+}
+
+void loadSystemTime() {
+  if (!fsMounted) return;
+  File file = LittleFS.open("/time.dat", "r");
+  if (file) {
+    file.read((byte*)&totalUptime, sizeof(totalUptime));
+    file.read((byte*)&firstBoot, sizeof(firstBoot));
+    file.close();
+    Serial.println("System time loaded from file");
+  } else {
+    totalUptime = 0;
+    firstBoot = true;
+    Serial.println("No time file found, starting fresh");
+  }
+}
+
+void saveInterval() {
+  if (!fsMounted) return;
+  File file = LittleFS.open("/interval.dat", "w");
+  if (file) {
+    file.write((byte*)&currentInterval, sizeof(currentInterval));
+    file.close();
+  }
+}
+
+void loadInterval() {
+  if (!fsMounted) return;
+  File file = LittleFS.open("/interval.dat", "r");
+  if (file) {
+    file.read((byte*)&currentInterval, sizeof(currentInterval));
+    file.close();
+    if (currentInterval < 1 || currentInterval > 3600) currentInterval = 60;
+    Serial.printf("Interval loaded: %d seconds\n", currentInterval);
+  }
+}
+
+// ============================================================================
+// АДРЕСА ДАТЧИКОВ (ВСТАВИТЬ СВОИ!)
+// ============================================================================
+void initSensors() {
+  byte a1[8] = {0x28, 0xD0, 0x07, 0x8B, 0x06, 0x00, 0x00, 0x17};
+  memcpy(sensorsList[0].addr, a1, 8);
+  sensorsList[0].name = "Sensor 1 (current)";
+  sensorsList[0].enabled = true;
+  sensorsList[0].currentTemp = 0;
+  sensorsList[0].histIndex = 0;
+  sensorsList[0].historyCount = 0;
+  
+  byte a2[8] = {0x28, 0xEE, 0x7B, 0x09, 0x20, 0x16, 0x01, 0x26};
+  memcpy(sensorsList[1].addr, a2, 8);
+  sensorsList[1].name = "Sensor 2 (inside)";
+  sensorsList[1].enabled = true;
+  sensorsList[1].currentTemp = 0;
+  sensorsList[1].histIndex = 0;
+  sensorsList[1].historyCount = 0;
+  
+  byte a3[8] = {0x28, 0xFF, 0x71, 0x13, 0x47, 0x16, 0x3, 0xB7};
+  memcpy(sensorsList[2].addr, a3, 8);
+  sensorsList[2].name = "Sensor 3 (soil)";
+  sensorsList[2].enabled = false;
+  sensorsList[2].currentTemp = 0;
+  sensorsList[2].histIndex = 0;
+  sensorsList[2].historyCount = 0;
+  
+  byte a4[8] = {0x28, 0xFF, 0xD5, 0xD6, 0x47, 0x16, 0x3, 0x23};
+  memcpy(sensorsList[3].addr, a4, 8);
+  sensorsList[3].name = "Sensor 4 (outside)";
+  sensorsList[3].enabled = false;
+  sensorsList[3].currentTemp = 0;
+  sensorsList[3].histIndex = 0;
+  sensorsList[3].historyCount = 0;
+}
+
+// ============================================================================
+// РОТАЦИЯ ФАЙЛА ИСТОРИИ
+// ============================================================================
+bool hasEnoughFreeSpace() {
+  if (!fsMounted) return false;
+  unsigned long freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes();
+  if (freeBytes < 50 * 1024) {
+    Serial.printf("WARNING: Low on space! Free: %lu bytes\n", freeBytes);
+    return false;
+  }
+  return true;
+}
+
+void transferLastLines(const char* sourceFile, const char* destFile, int linesToKeep) {
+  File src = LittleFS.open(sourceFile, "r");
+  if (!src) return;
+  int totalLines = 0;
+  while (src.available()) if (src.readStringUntil('\n').length() > 0) totalLines++;
+  src.seek(0);
+  int startLine = (totalLines > linesToKeep) ? (totalLines - linesToKeep) : 0;
+  File dst = LittleFS.open(destFile, "w");
+  if (!dst) { src.close(); return; }
+  int currentLine = 0;
+  while (src.available()) {
+    String line = src.readStringUntil('\n');
+    if (line.length() > 0 && currentLine >= startLine) dst.println(line);
+    currentLine++;
+  }
+  src.close(); dst.close();
+}
+
+void rotateHistoryFile() {
+  if (!fsMounted) return;
+  File file = LittleFS.open("/history.csv", "r");
+  if (!file) return;
+  unsigned long fileSize = file.size();
+  file.close();
+  if (fileSize > MAX_HISTORY_FILE_SIZE) {
+    Serial.printf("History file too large (%lu bytes), rotating...\n", fileSize);
+    if (LittleFS.exists(HISTORY_BACKUP_FILE)) LittleFS.remove(HISTORY_BACKUP_FILE);
+    if (LittleFS.rename("/history.csv", HISTORY_BACKUP_FILE)) {
+      Serial.println("History file rotated successfully");
+      File newFile = LittleFS.open("/history.csv", "w");
+      if (newFile) newFile.close();
+      transferLastLines(HISTORY_BACKUP_FILE, "/history.csv", 100);
+    }
+  }
+}
+
+// ============================================================================
+// ЗАГРУЗКА ИСТОРИИ ИЗ FLASH
+// ============================================================================
+void loadHistoryFromFlash() {
+  if (!fsMounted) return;
+  File file = LittleFS.open("/history.csv", "r");
+  if (!file) {
+    file = LittleFS.open(HISTORY_BACKUP_FILE, "r");
+    if (!file) { Serial.println("No history file found, starting fresh"); return; }
+    Serial.println("Loading from backup file");
+  }
+  int loadedCount = 0;
+  String line;
+  unsigned long lastTimestamp = 0;
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    sensorsList[i].histIndex = 0;
+    sensorsList[i].historyCount = 0;
+  }
+  while (file.available() && loadedCount < MAX_HISTORY) {
+    line = file.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    int comma1 = line.indexOf(',');
+    int comma2 = line.indexOf(',', comma1 + 1);
+    int comma3 = line.indexOf(',', comma2 + 1);
+    int comma4 = line.indexOf(',', comma3 + 1);
+    if (comma1 > 0 && comma4 > 0) {
+      unsigned long timestamp = line.substring(0, comma1).toInt();
+      float t0 = line.substring(comma1 + 1, comma2).toFloat();
+      float t1 = line.substring(comma2 + 1, comma3).toFloat();
+      float t2 = line.substring(comma3 + 1, comma4).toFloat();
+      float t3 = line.substring(comma4 + 1).toFloat();
+      if (sensorsList[0].historyCount < MAX_HISTORY) { sensorsList[0].history[sensorsList[0].historyCount] = t0; sensorsList[0].historyCount++; }
+      if (sensorsList[1].historyCount < MAX_HISTORY) { sensorsList[1].history[sensorsList[1].historyCount] = t1; sensorsList[1].historyCount++; }
+      if (sensorsList[2].historyCount < MAX_HISTORY) { sensorsList[2].history[sensorsList[2].historyCount] = t2; sensorsList[2].historyCount++; }
+      if (sensorsList[3].historyCount < MAX_HISTORY) { sensorsList[3].history[sensorsList[3].historyCount] = t3; sensorsList[3].historyCount++; }
+      loadedCount++;
+      lastTimestamp = timestamp;
+    }
+  }
+  file.close();
+  for (int i = 0; i < MAX_SENSORS; i++) sensorsList[i].histIndex = sensorsList[i].historyCount;
+  if (lastTimestamp > 0) totalUptime = lastTimestamp;
+  Serial.printf("Loaded %d points from Flash\n", loadedCount);
+}
+
+// ============================================================================
+// ЗАПИСЬ БУФЕРА В FLASH
+// ============================================================================
+void flushBufferToFlash() {
+  if (!fsMounted) return;
+  if (flashBuffer.index == 0) return;
+  if (!hasEnoughFreeSpace()) rotateHistoryFile();
+  File file = LittleFS.open("/history.csv", "a");
+  if (!file) {
+    file = LittleFS.open("/history.csv", "w");
+    if (!file) { Serial.println("CRITICAL: Cannot write to Flash!"); return; }
+  }
+  for (int i = 0; i < flashBuffer.index; i++) {
+    file.printf("%lu,%.1f,%.1f,%.1f,%.1f\n",
+      flashBuffer.timestamps[i],
+      flashBuffer.temps[0][i],
+      flashBuffer.temps[1][i],
+      flashBuffer.temps[2][i],
+      flashBuffer.temps[3][i]);
+  }
+  file.close();
+  Serial.printf("Saved %d points to Flash\n", flashBuffer.index);
+  flashBuffer.index = 0;
+  rotateHistoryFile();
+}
+
+void addToFlashBuffer(float temps[4], unsigned long timestamp) {
+  if (!fsMounted) return;
+  for (int s = 0; s < MAX_SENSORS; s++) flashBuffer.temps[s][flashBuffer.index] = temps[s];
+  flashBuffer.timestamps[flashBuffer.index] = timestamp;
+  flashBuffer.index++;
+  if (flashBuffer.index >= CSV_BUFFER_SIZE) flushBufferToFlash();
+}
+
+// ============================================================================
+// ЧТЕНИЕ ТЕМПЕРАТУРЫ С ДАТЧИКОВ
+// ============================================================================
+void readAllTemperatures() {
+  sensors.requestTemperatures();
+  unsigned long startWait = millis();
+  while ((millis() - startWait) < 750) { server.handleClient(); delay(10); }
+  float currentTemps[4];
+  unsigned long now = getRealTimestamp();
+  for (int i = 0; i < MAX_SENSORS; i++) {
+    float temp = sensors.getTempC(sensorsList[i].addr);
+    if (temp == DEVICE_DISCONNECTED_C) {
+      sensorsList[i].currentTemp = -127;
+      currentTemps[i] = -127;
+      Serial.printf("Sensor %d (%s) DISCONNECTED\n", i, sensorsList[i].name.c_str());
+      continue;
+    }
+    if (!isnan(temp) && temp > -50 && temp < 100) {
+      sensorsList[i].currentTemp = temp;
+      currentTemps[i] = temp;
+      if (sensorsList[i].enabled) {
+        if (sensorsList[i].historyCount < MAX_HISTORY) {
+          sensorsList[i].history[sensorsList[i].historyCount] = temp;
+          sensorsList[i].historyCount++;
+          sensorsList[i].histIndex = sensorsList[i].historyCount;
+        } else {
+          sensorsList[i].history[sensorsList[i].histIndex % MAX_HISTORY] = temp;
+          sensorsList[i].histIndex++;
+        }
+      }
+      Serial.printf("sensor%d:%.2f|g\n", i, temp);
+    } else {
+      sensorsList[i].currentTemp = -127;
+      currentTemps[i] = -127;
+      Serial.printf("Sensor %d (%s) INVALID: %.2f\n", i, sensorsList[i].name.c_str(), temp);
+    }
+  }
+  Serial.println("---");
+  addToFlashBuffer(currentTemps, now);
+}
+
+// ============================================================================
+// ФОРМИРОВАНИЕ JSON ДЛЯ ГРАФИКА
+// ============================================================================
+String getHistoryForSensor(int id) {
+  String data = "[";
+  int count = sensorsList[id].historyCount;
+  if (count == 0) { data += "]"; return data; }
+  int step = 1;
+  if (count > 800) step = count / 800;
+  if (step < 1) step = 1;
+  for (int j = 0; j < count; j += step) {
+    if (j > 0) data += ",";
+    data += String(sensorsList[id].history[j], 1);
+  }
+  data += "]";
+  return data;
+}
+
+// ============================================================================
+// HTML СТРАНИЦА (ВЕБ-ИНТЕРФЕЙС)
+// ============================================================================
+const char index_html[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+<title>Greenhouse Monitor</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0;}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#1a1a2e 0%,#16213e 100%);min-height:100vh;padding:16px;}
+.container{max-width:1200px;margin:0 auto;}
+h1{text-align:center;color:white;font-size:24px;margin-bottom:20px;}
+.sensors-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:16px;margin-bottom:20px;}
+.temp-item{background:rgba(255,255,255,0.95);border-radius:20px;padding:16px;}
+.temp-name{font-weight:bold;font-size:14px;color:#333;margin-bottom:6px;}
+.temp-addr{font-family:monospace;font-size:10px;color:#888;margin-bottom:10px;word-break:break-all;}
+.temp-value{font-size:32px;font-weight:bold;text-align:center;padding:10px;background:#f8f9fa;border-radius:12px;}
+.temp-value.ok{color:#27ae60;}
+.temp-value.error{color:#e74c3c;font-size:20px;}
+.checkbox-label{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:10px;font-size:12px;cursor:pointer;}
+.checkbox-label input{width:18px;height:18px;cursor:pointer;}
+.control-card{background:rgba(255,255,255,0.95);border-radius:20px;padding:20px;margin-bottom:20px;}
+.interval-buttons{display:flex;flex-wrap:wrap;gap:10px;justify-content:center;margin-bottom:15px;}
+.interval-btn{background:#667eea;color:white;border:none;padding:10px 20px;border-radius:25px;cursor:pointer;font-size:14px;}
+.interval-btn.active{background:#27ae60;box-shadow:0 0 10px #27ae60;}
+.custom-interval{display:flex;gap:10px;justify-content:center;align-items:center;margin-top:10px;}
+.custom-interval input{width:80px;padding:8px;border-radius:20px;border:1px solid #ddd;text-align:center;font-size:14px;}
+.custom-interval button{background:#667eea;color:white;border:none;padding:8px 16px;border-radius:20px;cursor:pointer;}
+.current-interval{text-align:center;margin-top:10px;font-size:14px;color:#333;}
+.graph-card{background:rgba(255,255,255,0.95);border-radius:20px;padding:20px;}
+.graph-title{text-align:center;font-weight:600;margin-bottom:15px;font-size:18px;}
+.graph-container{width:100%;height:450px;position:relative;}
+canvas{width:100%;height:100%;background:white;border-radius:12px;display:block;touch-action:none;}
+.controls{display:flex;gap:10px;justify-content:center;margin-top:15px;flex-wrap:wrap;}
+.controls button{background:#667eea;color:white;border:none;padding:8px 16px;border-radius:20px;cursor:pointer;}
+.zoom-btn{width:44px;height:44px;border-radius:50%;font-size:24px;font-weight:bold;padding:0;}
+.clear-btn{background:#e74c3c;}
+.clear-btn:hover{background:#c0392b;}
+.info{text-align:center;font-size:11px;color:#6c757d;margin-top:12px;}
+.legend{display:flex;flex-wrap:wrap;justify-content:center;gap:15px;margin-top:10px;}
+.legend-item{display:flex;align-items:center;gap:6px;font-size:11px;}
+.legend-color{width:16px;height:16px;border-radius:3px;}
+.status{text-align:center;margin-top:10px;font-size:12px;color:#27ae60;}
+.hours-info{text-align:center;font-size:11px;color:#888;margin-bottom:10px;}
+.download-btn{background:#2ecc71;margin-left:10px;}
+@media (max-width:768px){.graph-container{height:350px;}.temp-value{font-size:28px;}}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>🌡️ GREENHOUSE MONITOR</h1>
+<div class="control-card">
+<div class="interval-buttons" id="intervalBtns"></div>
+<div class="custom-interval"><span>🔧 Custom interval (seconds):</span><input type="number" id="customInterval" min="1" max="3600" value="60"><button onclick="setCustomInterval()">Apply</button></div>
+<div class="current-interval" id="currentIntervalInfo"></div>
+</div>
+<div class="sensors-grid" id="sensorsGrid"></div>
+<div class="graph-card">
+<div class="graph-title">📊 Temperature History</div>
+<div class="hours-info" id="hoursInfo"></div>
+<div class="graph-container"><canvas id="tempChart"></canvas></div>
+<div class="legend" id="legend"></div>
+<div class="controls">
+<button onclick="zoomIn()" class="zoom-btn">➕</button>
+<button onclick="zoomOut()" class="zoom-btn">➖</button>
+<button onclick="resetZoom()">🔄 Reset Zoom</button>
+<button class="download-btn" onclick="downloadCSV()">📥 Download CSV</button>
+<button onclick="downloadBackup()" class="download-btn" style="background:#f39c12;">📥 Backup</button>
+<button onclick="clearHistory()" class="clear-btn">🗑️ Clear</button>
+</div>
+<div class="info">💡 Touch: 1 finger drag | 2 fingers pinch | Mouse: drag + wheel</div>
+<div class="status" id="status"></div>
+<div class="info" id="networkInfo" style="margin-top:10px;font-size:10px;color:#888;"></div>
+<div class="info" id="storageInfo" style="margin-top:5px;font-size:10px;color:#888;"></div>
+</div>
+</div>
+<script>
+const colors=['#e74c3c','#3498db','#27ae60','#f39c12','#9b59b6','#1abc9c'];
+let sensorsList=[],activeSensors=[],historyData={},chart=null,zoomMin=0,zoomMax=100,currentInterval=60,totalPoints=0;
+let isDragging=false,dragStartX=0,dragStartMin=0,dragStartMax=0;
+let initialPinchDistance=0,initialZoomMin=0,initialZoomMax=0;
+function getPinchDistance(t){if(t.length<2)return 0;const dx=t[0].clientX-t[1].clientX,dy=t[0].clientY-t[1].clientY;return Math.sqrt(dx*dx+dy*dy);}
+function zoomIn(){if(totalPoints===0)return;let c=(zoomMin+zoomMax)/2,r=(zoomMax-zoomMin)*0.6,nm=Math.max(0,c-r/2),nx=Math.min(totalPoints,c+r/2);if(nx-nm>5){zoomMin=Math.floor(nm);zoomMax=Math.ceil(nx);drawChart();}}
+function zoomOut(){if(totalPoints===0)return;let c=(zoomMin+zoomMax)/2,r=(zoomMax-zoomMin)*1.5,nm=Math.max(0,c-r/2),nx=Math.min(totalPoints,c+r/2);if(nx-nm>5){zoomMin=Math.floor(nm);zoomMax=Math.ceil(nx);drawChart();}}
+function resetZoom(){let ml=0;for(let id of activeSensors)if(historyData[id]&&historyData[id].length>ml)ml=historyData[id].length;zoomMin=0;zoomMax=ml;drawChart();}
+function initIntervalButtons(){const btns=[{name:"⚡ FAST (3s)",val:3},{name:"📊 NORMAL (10s)",val:10},{name:"💾 ECO (30s)",val:30},{name:"📅 24 HOURS (60s)",val:60},{name:"🔧 CUSTOM",val:0}];const cont=document.getElementById('intervalBtns');cont.innerHTML='';btns.forEach(btn=>{const b=document.createElement('button');b.className='interval-btn';if(btn.val===currentInterval)b.classList.add('active');if(btn.val===0){b.innerText=btn.name;b.onclick=()=>showCustomInput();}else{b.innerText=btn.name;b.onclick=()=>setIntervalValue(btn.val);}cont.appendChild(b);});}
+function showCustomInput(){const val=document.getElementById('customInterval').value;setIntervalValue(parseInt(val));}
+function setCustomInterval(){const val=parseInt(document.getElementById('customInterval').value);if(val>=1&&val<=3600)setIntervalValue(val);else alert('Please enter value between 1 and 3600 seconds');}
+function setIntervalValue(sec){currentInterval=sec;fetch('/interval?sec='+sec);initIntervalButtons();document.getElementById('currentIntervalInfo').innerHTML=`📡 Update interval: <strong>${sec} seconds</strong>`;}
+function downloadCSV(){window.location.href='/download';}
+function downloadBackup(){window.location.href='/download_backup';}
+function initChart(){const c=document.getElementById('tempChart');c.width=c.clientWidth;c.height=c.clientHeight;chart={canvas:c,ctx:c.getContext('2d'),width:c.width,height:c.height,padding:{top:20,right:35,bottom:40,left:45}};drawChart();}
+function drawChart(){if(!chart)return;const ctx=chart.ctx,w=chart.width,h=chart.height,p=chart.padding;ctx.clearRect(0,0,w,h);ctx.fillStyle='white';ctx.fillRect(0,0,w,h);let allData=[];for(let id of activeSensors)if(historyData[id]&&historyData[id].length>0)allData=allData.concat(historyData[id]);if(allData.length===0||activeSensors.length===0){ctx.fillStyle='#999';ctx.font='14px Arial';ctx.textAlign='center';ctx.fillText('Select sensors to display',w/2,h/2);return;}let minTemp=Math.min(...allData),maxTemp=Math.max(...allData),maxLen=0;for(let id of activeSensors)if(historyData[id]&&historyData[id].length>maxLen)maxLen=historyData[id].length;totalPoints=maxLen;let minTime=zoomMin,maxTime=zoomMax;if(maxTime>maxLen)maxTime=maxLen;if(minTime>=maxTime){minTime=0;maxTime=maxLen;}const timeRange=maxTime-minTime;if(timeRange<=0)return;const tempRange=maxTemp-minTemp,yMin=minTemp-(tempRange*0.1),yMax=maxTemp+(tempRange*0.1),cw=w-p.left-p.right,ch=h-p.top-p.bottom;ctx.strokeStyle='#e0e0e0';ctx.lineWidth=1;ctx.setLineDash([5,5]);for(let i=0;i<=4;i++){const y=p.top+(ch*i/4);ctx.beginPath();ctx.moveTo(p.left,y);ctx.lineTo(w-p.right,y);ctx.stroke();ctx.setLineDash([]);ctx.fillStyle='#666';ctx.font='10px Arial';ctx.textAlign='right';const value=yMax-((yMax-yMin)*i/4);ctx.fillText(value.toFixed(1)+'°C',p.left-5,y+3);}ctx.setLineDash([]);for(let idx=0;idx<activeSensors.length;idx++){const id=activeSensors[idx],data=historyData[id];if(!data||data.length<2)continue;ctx.beginPath();ctx.strokeStyle=colors[idx%colors.length];ctx.lineWidth=2.5;let first=true;for(let i=Math.floor(minTime);i<=Math.floor(maxTime)&&i<data.length;i++){const x=p.left+((i-minTime)/timeRange)*cw,y=p.top+ch-((data[i]-yMin)/(yMax-yMin))*ch;if(first){ctx.moveTo(x,y);first=false;}else ctx.lineTo(x,y);}ctx.stroke();}for(let i=0;i<=4;i++){const timePos=minTime+(timeRange*i/4),x=p.left+(i/4)*cw,secondsAgo=Math.round((maxLen-timePos)*currentInterval);let label='';if(secondsAgo<60)label=secondsAgo+'s';else if(secondsAgo<3600)label=Math.floor(secondsAgo/60)+'m';else if(secondsAgo<86400)label=Math.floor(secondsAgo/3600)+'h';else label=Math.floor(secondsAgo/86400)+'d';ctx.fillStyle='#888';ctx.font='9px Arial';ctx.textAlign='center';ctx.fillText(label,x,h-p.bottom+12);}const hoursAvail=(maxLen*currentInterval/3600).toFixed(1);document.getElementById('hoursInfo').innerHTML=`📊 History: ${maxLen} points | ${hoursAvail}h | View: ${Math.floor(zoomMin)}-${Math.floor(zoomMax)}`;document.getElementById('status').innerHTML=`✅ Updated: ${new Date().toLocaleTimeString()} | Points: ${maxLen}`;}
+function updateStorageInfo(){fetch('/storage').then(r=>r.json()).then(d=>{const div=document.getElementById('storageInfo');if(div){const fp=(d.freeBytes/d.totalBytes*100).toFixed(1);div.innerHTML=`💾 Storage: ${(d.usedBytes/1024).toFixed(0)}KB / ${(d.totalBytes/1024).toFixed(0)}KB (${fp}% free) | File: ${(d.historyFileSize/1024).toFixed(0)}KB`;div.style.color=fp<10?'#e74c3c':'#888';}}).catch(console.log);}
+function updateData(){fetch('/data').then(r=>r.json()).then(d=>{sensorsList=d.sensors;activeSensors=d.activeSensors;historyData=d.history;if(d.interval)currentInterval=d.interval;const grid=document.getElementById('sensorsGrid');grid.innerHTML='';for(let i=0;i<sensorsList.length;i++){const s=sensorsList[i],ok=(s.temp>-100&&s.temp!==85);grid.innerHTML+=`<div class="temp-item"><div class="temp-name">${s.name}</div><div class="temp-addr">${s.addr}</div><div class="temp-value ${ok?'ok':'error'}">${ok?s.temp.toFixed(1)+'°C':'NO SENSOR'}</div><label class="checkbox-label"><input type="checkbox" id="chk_${i}" onchange="toggleSensor(${i})" ${s.enabled?'checked':''}><span>📊 Show on graph</span></label></div>`;}const legDiv=document.getElementById('legend');legDiv.innerHTML='';for(let idx=0;idx<activeSensors.length;idx++){const id=activeSensors[idx];legDiv.innerHTML+=`<div class="legend-item"><div class="legend-color" style="background:${colors[idx%colors.length]}"></div><span>${sensorsList[id].name}</span></div>`;}let maxLen=0;for(let id of activeSensors)if(historyData[id]&&historyData[id].length>maxLen)maxLen=historyData[id].length;const wasAtEnd=(zoomMax>=totalPoints-5);if(wasAtEnd||zoomMax>=maxLen-5){const range=zoomMax-zoomMin;zoomMax=maxLen;zoomMin=Math.max(0,maxLen-range);}if(zoomMin<0)zoomMin=0;if(zoomMax>maxLen)zoomMax=maxLen;if(zoomMin>zoomMax-5&&zoomMax>5)zoomMin=Math.max(0,zoomMax-50);initIntervalButtons();document.getElementById('currentIntervalInfo').innerHTML=`📡 Update interval: <strong>${currentInterval} seconds</strong>`;drawChart();}).catch(console.log);}
+function toggleSensor(id){const chk=document.getElementById('chk_'+id).checked;fetch('/toggle?sensor='+id+'&state='+(chk?'1':'0')).then(()=>setTimeout(updateData,100));}
+function handleMouseDown(e){const c=document.getElementById('tempChart'),rect=c.getBoundingClientRect(),sx=c.width/rect.width,x=(e.clientX-rect.left)*sx,p=chart.padding;if(x>=p.left&&x<=c.width-p.right){isDragging=true;dragStartX=x;dragStartMin=zoomMin;dragStartMax=zoomMax;c.style.cursor='grabbing';}}
+function handleMouseMove(e){if(!isDragging)return;const c=document.getElementById('tempChart'),rect=c.getBoundingClientRect(),sx=c.width/rect.width,x=(e.clientX-rect.left)*sx,p=chart.padding;let maxLen=0;for(let id of activeSensors)if(historyData[id]&&historyData[id].length>maxLen)maxLen=historyData[id].length;if(maxLen===0)return;const dx=x-dragStartX,range=dragStartMax-dragStartMin;if(range<=0)return;const dp=(dx/(c.width-p.left-p.right))*range;let nm=dragStartMin-dp,nx=dragStartMax-dp;if(nm<0){nm=0;nx=range;}if(nx>maxLen){nx=maxLen;nm=maxLen-range;}if(nm>=0&&nx<=maxLen&&(nx-nm)>5){zoomMin=Math.floor(nm);zoomMax=Math.ceil(nx);drawChart();}}
+function handleMouseUp(){isDragging=false;document.getElementById('tempChart').style.cursor='default';}
+function handleTouchStart(e){e.preventDefault();const t=e.touches,c=document.getElementById('tempChart');if(t.length===1){const rect=c.getBoundingClientRect(),sx=c.width/rect.width,x=(t[0].clientX-rect.left)*sx,p=chart.padding;if(x>=p.left&&x<=c.width-p.right){isDragging=true;dragStartX=x;dragStartMin=zoomMin;dragStartMax=zoomMax;}}else if(t.length===2){isDragging=false;initialPinchDistance=getPinchDistance(t);initialZoomMin=zoomMin;initialZoomMax=zoomMax;}}
+function handleTouchMove(e){e.preventDefault();const t=e.touches,c=document.getElementById('tempChart');if(t.length===1&&isDragging){const rect=c.getBoundingClientRect(),sx=c.width/rect.width,x=(t[0].clientX-rect.left)*sx,p=chart.padding;let maxLen=0;for(let id of activeSensors)if(historyData[id]&&historyData[id].length>maxLen)maxLen=historyData[id].length;if(maxLen===0)return;const dx=x-dragStartX,range=dragStartMax-dragStartMin;if(range<=0)return;const dp=(dx/(c.width-p.left-p.right))*range;let nm=dragStartMin-dp,nx=dragStartMax-dp;if(nm<0){nm=0;nx=range;}if(nx>maxLen){nx=maxLen;nm=maxLen-range;}if(nm>=0&&nx<=maxLen&&(nx-nm)>5){zoomMin=Math.floor(nm);zoomMax=Math.ceil(nx);drawChart();}}else if(t.length===2&&initialPinchDistance>0){const nd=getPinchDistance(t);if(nd>0){const ratio=initialPinchDistance/nd,cx=(t[0].clientX+t[1].clientX)/2,rect=c.getBoundingClientRect(),sx=c.width/rect.width,x=(cx-rect.left)*sx,p=chart.padding,cx2=Math.max(p.left,Math.min(c.width-p.right,x));let maxLen=0;for(let id of activeSensors)if(historyData[id]&&historyData[id].length>maxLen)maxLen=historyData[id].length;if(maxLen===0)return;const cw=c.width-p.left-p.right,tv=(cx2-p.left)/cw,centerIdx=initialZoomMin+tv*(initialZoomMax-initialZoomMin),newRange=(initialZoomMax-initialZoomMin)*ratio;if(newRange<5||newRange>maxLen)return;let nm=centerIdx-(centerIdx-initialZoomMin)*ratio,nx=centerIdx+(initialZoomMax-centerIdx)*ratio;if(nm<0){nm=0;nx=newRange;}if(nx>maxLen){nx=maxLen;nm=maxLen-newRange;}if(nx-nm>5){zoomMin=Math.max(0,Math.floor(nm));zoomMax=Math.min(maxLen,Math.ceil(nx));drawChart();}}}}
+function handleTouchEnd(e){e.preventDefault();isDragging=false;initialPinchDistance=0;document.getElementById('tempChart').style.cursor='default';}
+function handleWheel(e){e.preventDefault();zoomAtPosition(e.deltaY>0?1.2:0.8,e.clientX,document.getElementById('tempChart'));}
+function zoomAtPosition(factor,clientX,canvas){if(totalPoints===0)return;const rect=canvas.getBoundingClientRect(),sx=canvas.width/rect.width;let x=(clientX-rect.left)*sx;const p=chart.padding;x=Math.max(p.left,Math.min(canvas.width-p.right,x));const cw=canvas.width-p.left-p.right,timeRange=zoomMax-zoomMin,centerIdx=zoomMin+((x-p.left)/cw)*timeRange,newRange=timeRange*factor;if(newRange<5||newRange>totalPoints)return;let nm=centerIdx-(centerIdx-zoomMin)*factor,nx=centerIdx+(zoomMax-centerIdx)*factor;if(nm<0){nm=0;nx=newRange;}if(nx>totalPoints){nx=totalPoints;nm=totalPoints-newRange;}if(nx-nm>5){zoomMin=Math.max(0,Math.floor(nm));zoomMax=Math.min(totalPoints,Math.ceil(nx));drawChart();}}
+function clearHistory(){if(confirm('⚠️ Are you sure? This will delete ALL temperature history!')){fetch('/clear').then(r=>r.json()).then(d=>{if(d.ok){historyData={};for(let i=0;i<sensorsList.length;i++)historyData[i]=[];zoomMin=0;zoomMax=100;totalPoints=0;drawChart();document.getElementById('status').innerHTML='✅ History cleared!';document.getElementById('hoursInfo').innerHTML='📊 History: 0 points | 0 hours';setTimeout(updateData,2000);}}).catch(console.log);}}
+function showNetworkInfo(){fetch('/ip').then(r=>r.json()).then(d=>{const div=document.getElementById('networkInfo');if(div)div.innerHTML='🏠 Home: '+d.sta_ip+' | 📱 AP: '+d.ap_ip;}).catch(()=>{const div=document.getElementById('networkInfo');if(div)div.innerHTML='🏠 Home: not connected | 📱 AP: 10.0.0.1';});}
+document.addEventListener('DOMContentLoaded',()=>{initChart();updateData();showNetworkInfo();updateStorageInfo();setInterval(updateData,3000);setInterval(updateStorageInfo,60000);const c=document.getElementById('tempChart');c.addEventListener('mousedown',handleMouseDown);window.addEventListener('mousemove',handleMouseMove);window.addEventListener('mouseup',handleMouseUp);c.addEventListener('wheel',handleWheel);c.addEventListener('touchstart',handleTouchStart,{passive:false});c.addEventListener('touchmove',handleTouchMove,{passive:false});c.addEventListener('touchend',handleTouchEnd);c.addEventListener('touchcancel',handleTouchEnd);});
+</script>
+</body>
+</html>
+)rawliteral";
+
+// ============================================================================
+// ОБРАБОТЧИКИ HTTP ЗАПРОСОВ
+// ============================================================================
+void handleRoot() { server.send_P(200, "text/html", index_html); }
+void handleData() { readAllTemperatures(); String json = "{\"sensors\":["; for (int i = 0; i < MAX_SENSORS; i++) { if (i > 0) json += ","; json += "{\"name\":\"" + sensorsList[i].name + "\",\"addr\":\"" + addrToString(sensorsList[i].addr) + "\",\"temp\":" + String(sensorsList[i].currentTemp, 1) + ",\"enabled\":" + String(sensorsList[i].enabled ? "true" : "false") + "}"; } json += "],\"activeSensors\":["; bool first = true; for (int i = 0; i < MAX_SENSORS; i++) { if (sensorsList[i].enabled) { if (!first) json += ","; json += String(i); first = false; } } json += "],\"history\":{"; first = true; for (int i = 0; i < MAX_SENSORS; i++) { if (sensorsList[i].enabled) { if (!first) json += ","; json += "\"" + String(i) + "\":" + getHistoryForSensor(i); first = false; } } json += "},\"interval\":" + String(currentInterval) + "}"; server.send(200, "application/json", json); }
+void handleToggle() { if (server.hasArg("sensor") && server.hasArg("state")) { int id = server.arg("sensor").toInt(); int val = server.arg("state").toInt(); if (id >= 0 && id < MAX_SENSORS) sensorsList[id].enabled = (val == 1); } server.send(200, "application/json", "{\"ok\":1}"); }
+void handleInterval() { if (server.hasArg("sec")) { int sec = server.arg("sec").toInt(); if (sec >= 1 && sec <= 3600) { currentInterval = sec; saveInterval(); } } server.send(200, "application/json", "{\"ok\":1}"); }
+void handleDownload() { if (!fsMounted) { server.send(500, "text/plain", "FS not mounted"); return; } File file = LittleFS.open("/history.csv", "r"); if (!file) { server.send(404, "text/plain", "No history file"); return; } server.sendHeader("Content-Disposition", "attachment; filename=temperature_history.csv"); server.streamFile(file, "text/csv"); file.close(); }
+void handleDownloadBackup() { if (!fsMounted) { server.send(500, "text/plain", "FS not mounted"); return; } if (!LittleFS.exists(HISTORY_BACKUP_FILE)) { server.send(404, "text/plain", "No backup file"); return; } File file = LittleFS.open(HISTORY_BACKUP_FILE, "r"); server.sendHeader("Content-Disposition", "attachment; filename=history_backup.csv"); server.streamFile(file, "text/csv"); file.close(); }
+void handleClear() { if (!fsMounted) { server.send(500, "text/plain", "FS not mounted"); return; } LittleFS.remove("/history.csv"); if (LittleFS.exists(HISTORY_BACKUP_FILE)) LittleFS.remove(HISTORY_BACKUP_FILE); for (int i = 0; i < MAX_SENSORS; i++) { sensorsList[i].histIndex = 0; sensorsList[i].historyCount = 0; } flashBuffer.index = 0; totalUptime = getRealTimestamp(); saveSystemTime(); server.send(200, "application/json", "{\"ok\":1}"); }
+void handleIP() { server.send(200, "application/json", "{\"sta_ip\":\"" + WiFi.localIP().toString() + "\",\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\"}"); }
+void handleHealth() { server.send(200, "application/json", "{\"freeHeap\":" + String(ESP.getFreeHeap()) + ",\"fsTotal\":" + String(LittleFS.totalBytes()) + ",\"fsUsed\":" + String(LittleFS.usedBytes()) + ",\"bufferPending\":" + String(flashBuffer.index) + "}"); }
+void handleStorage() { if (!fsMounted) { server.send(500, "application/json", "{\"error\":\"FS not mounted\"}"); return; } unsigned long fileSize = 0; File file = LittleFS.open("/history.csv", "r"); if (file) { fileSize = file.size(); file.close(); } server.send(200, "application/json", "{\"totalBytes\":" + String(LittleFS.totalBytes()) + ",\"usedBytes\":" + String(LittleFS.usedBytes()) + ",\"freeBytes\":" + String(LittleFS.totalBytes() - LittleFS.usedBytes()) + ",\"historyFileSize\":" + String(fileSize) + ",\"hasBackup\":" + String(LittleFS.exists(HISTORY_BACKUP_FILE) ? "true" : "false") + "}"); }
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+  Serial.begin(115200);
+  Serial.println("\n==========================================\n     GREENHOUSE MONITOR v5.0 FINAL\n     AP+STA + TOUCH ZOOM\n==========================================");
+  if (LittleFS.begin()) { fsMounted = true; Serial.println("✓ LittleFS mounted"); } 
+  else { Serial.println("! Formatting..."); if (LittleFS.format() && LittleFS.begin()) fsMounted = true; }
+  loadSystemTime(); loadInterval();
+  if (firstBoot) { totalUptime = 0; firstBoot = false; saveSystemTime(); Serial.println("First boot"); }
+  sensors.begin(); initSensors(); loadHistoryFromFlash(); delay(100); readAllTemperatures();
+  flashBuffer.index = 0; lastAutoFlush = millis(); lastSavedTime = millis();
+  WiFi.mode(WIFI_AP_STA);
+  Serial.print("\nConnecting to home WiFi..."); WiFi.begin(sta_ssid, sta_password);
+  int attempts = 0; while (WiFi.status() != WL_CONNECTED && attempts < 20) { delay(500); Serial.print("."); attempts++; }
+  Serial.println(WiFi.status() == WL_CONNECTED ? "\n✓ Connected!" : "\n✗ Failed, AP mode only");
+  WiFi.softAP(ssid, password); WiFi.softAPConfig(IPAddress(10,0,0,1), IPAddress(10,0,0,1), IPAddress(255,255,255,0));
+  Serial.printf("✓ AP: %s | IP: %s\n", ssid, WiFi.softAPIP().toString().c_str());
+  if (MDNS.begin("greenhouse")) { Serial.println("✓ mDNS: http://greenhouse.local"); MDNS.addService("http", "tcp", 80); }
+  server.on("/", handleRoot); server.on("/data", handleData); server.on("/toggle", handleToggle);
+  server.on("/interval", handleInterval); server.on("/download", handleDownload);
+  server.on("/download_backup", handleDownloadBackup); server.on("/clear", handleClear);
+  server.on("/ip", handleIP); server.on("/health", handleHealth); server.on("/storage", handleStorage);
+  server.begin();
+  Serial.println("\n==========================================");
+  Serial.printf("📱 Connect to: http://%s\n", WiFi.softAPIP().toString().c_str());
+  if (WiFi.status() == WL_CONNECTED) Serial.printf("🏠 Or: http://%s\n", WiFi.localIP().toString().c_str());
+  Serial.printf("⏱️ Interval: %d seconds\n", currentInterval);
+  Serial.println("==========================================\n");
+}
+
+// ============================================================================
+// LOOP
+// ============================================================================
+unsigned long lastRead = 0;
+void loop() {
+  unsigned long now = millis();
+  if (now - lastRead >= (unsigned long)currentInterval * 1000) { lastRead = now; readAllTemperatures(); }
+  if (fsMounted && flashBuffer.index > 0 && (now - lastAutoFlush >= AUTO_FLUSH_INTERVAL)) { lastAutoFlush = now; flushBufferToFlash(); }
+  if (fsMounted && (now - lastSavedTime >= 60000)) saveSystemTime();
+  static unsigned long lastRot = 0; if (fsMounted && (now - lastRot >= 3600000)) { lastRot = now; rotateHistoryFile(); }
+  server.handleClient(); delay(10);
+}
