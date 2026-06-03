@@ -16,9 +16,9 @@
 // ============================= НАСТРОЙКИ СИСТЕМЫ ============================
 // ============================================================================
 const char* ssid = "TERMO_LABORATORY";
-const char* password = "www111www";
-const char* sta_ssid = "Cudy-A12E";
-const char* sta_password = "48276030";
+const char* password = "www111www0";
+const char* sta_ssid = "Cudy-A12E0";
+const char* sta_password = "482760300";
 
 #define DS18B20_PIN 4
 #define MAX_HISTORY 1440
